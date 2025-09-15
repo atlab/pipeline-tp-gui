@@ -19,6 +19,7 @@ from . import main, forms, tables
 from .. import schemata
 from ..schemata import experiment, shared, reso, meso, stack, pupil, treadmill, tune, xcorr, mice, stimulus
 
+broken_tune_tables = (tune.CaMovie, tune.TimeOriMap, tune.TrippyDesign, tune.TrippyMap, tune.MovieOracleTimeCourse.OracleClipSet)
 
 def escape_json(json_string):
     """ Clean JSON strings so they can be used as html attributes."""
@@ -210,6 +211,8 @@ def quality():
             for schema_ in [pipe, pupil, tune]:
                 for cls in filter(lambda x: issubclass(x, (dj.Computed, dj.Imported)),
                                   filter(isclass, map(lambda x: getattr(schema_, x), dir(schema_)))):
+                    if issubclass(cls, broken_tune_tables):
+                        continue
                     items.append({'relation': cls.__name__, 'populated': bool(cls() & key)})
             progress_table = tables.CheckmarkTable(items)
 
@@ -413,7 +416,7 @@ def scanreport(animal_id, session, scan_idx):
         for field_key in (pipe.ScanInfo.Field() * channels & key).fetch('KEY'):
             field_key['has_summary'] = bool(pipe.SummaryImages() & field_key)
             field_key['has_oracle'] = bool(tune.OracleMap() & field_key)
-            field_key['has_cos2map'] = bool(tune.Cos2Map() * tune.CaMovie() & field_key)
+            field_key['has_cos2map'] = bool(tune.Cos2Map() * pixeltune.CaMovie() & field_key)
             image_keys.append(field_key)
         image_keys = list(filter(lambda k: k['has_summary'] or k['has_oracle'] or k['has_cos2map'], image_keys))
 

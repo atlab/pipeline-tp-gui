@@ -12,6 +12,14 @@ stimulus = dj.create_virtual_module('stimulus','pipeline_stimulus')
 xcorr = dj.create_virtual_module('xcorr','pipeline_xcorr')
 mice = dj.create_virtual_module('mice ','common_mice')
 stack = dj.create_virtual_module('stack ','pipeline_stack')
+pixeltune = dj.create_virtual_module('pixeltune ','pipeline_pixeltune')
+
+dj.config['stores'] = {
+    'external_dev': dict(
+        protocol='file',
+        location='/mnt/dj-stor01/pipeline-externals/'
+    )
+}
 
 dj.config['external-analysis'] = dict(
     protocol='file',
