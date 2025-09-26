@@ -1,6 +1,8 @@
 from collections import OrderedDict
 from inspect import isclass
-from slacker import Slacker
+# from slacker import Slacker
+from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
 from datetime import datetime, timedelta
 import pandas as pd
 import datajoint as dj
@@ -624,52 +626,93 @@ def surgery_update(animal_id, surgery_id):
 
 @main.route('/api/v1/surgery/notification', methods=['GET'])
 def surgery_notification():
-    # Sends notifications to specified slack channel, surgeon, and lab manager about any checkups that need to be done
-    num_to_word = {1: 'one', 2: 'two', 3: 'three'} # Used to figure out which column to look up for checkup date
+    num_to_word = {1: 'one', 2: 'two', 3: 'three'}
 
-    # Define all Slack notification variables
-    slack_notification_channel = "#surgery_reminders"
-    slack_manager = "camila"
+    slack_notification_channel = "#surgery_reminders"   # ideally store channel ID e.g. "C0123…"
+    slack_manager = "camila"                             # ideally store user ID e.g. "U0123…"
+
     slacktable = dj.create_virtual_module('pipeline_notification', 'pipeline_notification')
     domain, api_key = slacktable.SlackConnection.fetch1('domain', 'api_key')
-    slack = Slacker(api_key, timeout=60)
+    client = WebClient(token=api_key)
+
+    def ensure_channel_id(name_or_id):
+        if name_or_id and name_or_id[0] in "CDG":
+            return name_or_id
+        cname = name_or_id.lstrip('#')
+        resp = client.conversations_list(limit=1000, types="public_channel,private_channel")
+        for ch in resp.get('channels', []):
+            if ch['name'] == cname:
+                return ch['id']
+        return None
+
+    def user_id_from_name(name_or_id):
+        if name_or_id and name_or_id[0] == "U":
+            return name_or_id
+        resp = client.users_list(limit=1000)
+        for u in resp.get('members', []):
+            if u.get('name') == name_or_id or u.get('profile', {}).get('display_name') == name_or_id:
+                return u['id']
+        return None
+
+    def dm_channel_for(user_id):
+        resp = client.conversations_open(users=[user_id])
+        return resp['channel']['id']
 
     try:
-
-        # Only fetch surgeries done 1 to 3 days ago
-        lessthan_date_res = (datetime.today()).strftime("%Y-%m-%d")
-        greaterthan_date_res = (datetime.today() - timedelta(days=4)).strftime("%Y-%m-%d")
-        restriction = 'surgery_outcome = "Survival" and date < "{}" and date > "{}"'.format(lessthan_date_res,
-                                                                                            greaterthan_date_res)
+        # restrict to surgeries 1–3 days ago
+        today = datetime.today().date()
+        lessthan_date_res = today.strftime("%Y-%m-%d")
+        greaterthan_date_res = (today - timedelta(days=4)).strftime("%Y-%m-%d")
+        restriction = (
+            'surgery_outcome = "Survival" and date < "{}" and date > "{}"'
+            .format(lessthan_date_res, greaterthan_date_res)
+        )
         surgery_data = (experiment.Surgery & restriction).fetch(order_by='date DESC')
+
+        channel_id = ensure_channel_id(slack_notification_channel)
+        manager_uid = user_id_from_name(slack_manager)
+        manager_dm = dm_channel_for(manager_uid) if manager_uid else None
 
         for entry in surgery_data:
             status = (experiment.SurgeryStatus & entry).fetch(order_by="timestamp DESC")[0]
-            day_key = "day_" + num_to_word[(datetime.today().date() - entry['date']).days]
+            delta_days = (today - entry['date']).days
+            if delta_days not in (1, 2, 3):
+                continue
+            day_key = "day_" + num_to_word[delta_days]
 
-            edit_url = "<{}|Update Status Here>".format(url_for('main.surgery_update',
-                                                                _external=True,
-                                                                animal_id=entry['animal_id'],
-                                                                surgery_id=entry['surgery_id']))
+            edit_url = "<{}|Update Status Here>".format(
+                url_for('main.surgery_update', _external=True,
+                        animal_id=entry['animal_id'], surgery_id=entry['surgery_id'])
+            )
+
             if status['euthanized'] == 0 and status[day_key] == 0:
-                manager_message = "{} needs to check animal {} in room {} for surgery on {}. {}".format(
-                                                                                                entry['username'].title(),
-                                                                                                entry['animal_id'],
-                                                                                                entry['mouse_room'],
-                                                                                                entry['date'],
-                                                                                                edit_url)
-                ch_message = "<!channel> Reminder: " + manager_message
-                slack.chat.post_message("@" + slack_manager, manager_message)
-                slack.chat.post_message(slack_notification_channel, ch_message)
+                manager_message = (
+                    f"{entry['username'].title()} needs to check animal {entry['animal_id']} "
+                    f"in room {entry['mouse_room']} for surgery on {entry['date']}. {edit_url}"
+                )
+                ch_message = f"<!channel> Reminder: {manager_message}"
+
+                if manager_dm:
+                    client.chat_postMessage(channel=manager_dm, text=manager_message)
+                if channel_id:
+                    client.chat_postMessage(channel=channel_id, text=ch_message)
+
                 if len(slacktable.SlackUser & entry) > 0:
-                    slackname = (slacktable.SlackUser & entry).fetch('slack_user')
-                    pm_message = "Don't forget to check on animal {} today! {}".format(entry['animal_id'], edit_url)
-                    slack.chat.post_message("@" + slackname, pm_message, as_user=True)
+                    # prefer storing UIDs (U…) in SlackUser.slack_user; otherwise resolve name → UID
+                    surgeon_key = (slacktable.SlackUser & entry)
+                    slack_id_or_name = surgeon_key.fetch1('slack_user') \
+                        if hasattr(surgeon_key, 'fetch1') else surgeon_key.fetch('slack_user')[0]
+                    surgeon_uid = user_id_from_name(slack_id_or_name)
+                    if surgeon_uid:
+                        dm = dm_channel_for(surgeon_uid)
+                        pm_message = f"Don't forget to check on animal {entry['animal_id']} today! {edit_url}"
+                        client.chat_postMessage(channel=dm, text=pm_message)
 
+    except SlackApiError as e:
+        # log; don't try to post the error to Slack again
+        app.logger.exception(f"Slack API error: {e.response.get('error')}")
     except Exception as e:
-
-        error_message = f"WARNING! Notification system failed. Caught an exception of type: {type(e).__name__}. Error message: {str(e)}"
-        slack.chat.post_message(slack_notification_channel, error_message)
+        app.logger.exception(f"Notification failed: {e}")
 
     return '', http.HTTPStatus.NO_CONTENT
 
