@@ -1,9 +1,7 @@
 from collections import OrderedDict
 from inspect import isclass
-# from slacker import Slacker
-from slack_sdk import WebClient
-from slack_sdk.errors import SlackApiError
 from datetime import datetime, timedelta
+
 import pandas as pd
 import datajoint as dj
 import uuid
@@ -13,7 +11,9 @@ import mpld3
 import graphviz
 import json
 import http
-from flask import render_template, redirect, url_for, flash, request, session, send_from_directory, Markup
+from http import HTTPStatus
+
+from flask import render_template, redirect, current_app, url_for, flash, request, session, send_from_directory, Markup, jsonify
 from flask_weasyprint import render_pdf, HTML, CSS
 from pymysql.err import IntegrityError
 
@@ -23,11 +23,16 @@ from ..schemata import experiment, shared, reso, meso, stack, pupil, treadmill, 
 
 broken_tune_tables = (tune.CaMovie, tune.TimeOriMap, tune.TrippyDesign, tune.TrippyMap, tune.MovieOracleTimeCourse.OracleClipSet)
 
+from slack_sdk.errors import SlackApiError
+from app.integrations.slack_helpers import SlackClient
+
 def escape_json(json_string):
     """ Clean JSON strings so they can be used as html attributes."""
     return json_string.replace('"', '&quot;')
 
-
+@main.route("/healthz", methods=["GET"])
+def healthz():
+    return jsonify(status="ok"), 200
 
 @main.route('/')
 def index():
@@ -626,95 +631,157 @@ def surgery_update(animal_id, surgery_id):
 
 @main.route('/api/v1/surgery/notification', methods=['GET'])
 def surgery_notification():
+    """
+    Sends surgery follow-up reminders via Slack.
+    Supports:
+      - ?force=1   -> force sending even if status flags say "done"
+      - ?test=1    -> send a single test message to verify logging/wiring
+    """
     num_to_word = {1: 'one', 2: 'two', 3: 'three'}
+    slack = SlackClient()
 
-    slack_notification_channel = "#surgery_reminders"   # ideally store channel ID e.g. "C0123…"
-    slack_manager = "camila"                             # ideally store user ID e.g. "U0123…"
+    force = str(request.args.get('force', '')).lower() in ('1', 'true', 'yes', 'y')
+    run_test = str(request.args.get('test', '')).lower() in ('1', 'true', 'yes', 'y')
 
-    slacktable = dj.create_virtual_module('pipeline_notification', 'pipeline_notification')
-    domain, api_key = slacktable.SlackConnection.fetch1('domain', 'api_key')
-    client = WebClient(token=api_key)
+    if run_test:
+        msg = "[test] surgery notification logger check"
+        current_app.logger.info(f"[SurgeryNotify TEST] dry_run={slack.env.notify_dry_run} -> {msg}")
+        try:
+            slack.send_to_surgery_channel(msg, ping_channel=True)
+            slack.dm_surgery_manager(msg)
+            slack.send_to_shikigami_feed(f"[surgery] {msg}")
+            return jsonify({
+                "status": "ok",
+                "test": True,
+                "dry_run": slack.env.notify_dry_run,
+                "message": msg,
+            }), HTTPStatus.OK
+        except Exception as e:
+            current_app.logger.exception(f"[SurgeryNotify TEST] failed: {e}")
+            # notify shikigami manager on test failure too
+            try:
+                slack.dm_shikigami_manager(f":warning: Surgery notify test failed: {e}")
+            except Exception:
+                pass
+            return jsonify({"status": "error", "error": str(e)}), HTTPStatus.INTERNAL_SERVER_ERROR
 
-    def ensure_channel_id(name_or_id):
-        if name_or_id and name_or_id[0] in "CDG":
-            return name_or_id
-        cname = name_or_id.lstrip('#')
-        resp = client.conversations_list(limit=1000, types="public_channel,private_channel")
-        for ch in resp.get('channels', []):
-            if ch['name'] == cname:
-                return ch['id']
-        return None
+    sent = 0
+    skipped = 0
+    errors = 0
+    notes = []
 
-    def user_id_from_name(name_or_id):
-        if name_or_id and name_or_id[0] == "U":
-            return name_or_id
-        resp = client.users_list(limit=1000)
-        for u in resp.get('members', []):
-            if u.get('name') == name_or_id or u.get('profile', {}).get('display_name') == name_or_id:
-                return u['id']
-        return None
-
-    def dm_channel_for(user_id):
-        resp = client.conversations_open(users=[user_id])
-        return resp['channel']['id']
+    today = datetime.today().date()
 
     try:
-        # restrict to surgeries 1–3 days ago
-        today = datetime.today().date()
-        lessthan_date_res = today.strftime("%Y-%m-%d")
-        greaterthan_date_res = (today - timedelta(days=4)).strftime("%Y-%m-%d")
+        # restrict to surgeries 1–3 days ago, outcome=Survival
+        less_than = today.strftime("%Y-%m-%d")
+        greater_than = (today - timedelta(days=4)).strftime("%Y-%m-%d")
         restriction = (
             'surgery_outcome = "Survival" and date < "{}" and date > "{}"'
-            .format(lessthan_date_res, greaterthan_date_res)
-        )
-        surgery_data = (experiment.Surgery & restriction).fetch(order_by='date DESC')
+        ).format(less_than, greater_than)
 
-        channel_id = ensure_channel_id(slack_notification_channel)
-        manager_uid = user_id_from_name(slack_manager)
-        manager_dm = dm_channel_for(manager_uid) if manager_uid else None
+        # tables
+        experiment = dj.create_virtual_module('experiment', 'pipeline_experiment')
+        slacktable = dj.create_virtual_module('pipeline_notification', 'pipeline_notification')
 
-        for entry in surgery_data:
-            status = (experiment.SurgeryStatus & entry).fetch(order_by="timestamp DESC")[0]
+        surgeries = (experiment.Surgery & restriction).fetch(order_by='date DESC', as_dict=True)
+
+        for entry in surgeries:
+            # latest status, if any
+            statuses = (experiment.SurgeryStatus & entry).fetch(order_by="timestamp DESC", as_dict=True)
+            if not statuses:
+                msg = (f"No SurgeryStatus for animal_id={entry['animal_id']} "
+                       f"surgery_id={entry['surgery_id']}; skipping.")
+                current_app.logger.info(f"[SurgeryNotify SKIP] {msg}")
+                notes.append(f"skip: no_status (animal_id={entry['animal_id']})")
+                skipped += 1
+                continue
+
+            status = statuses[0]
             delta_days = (today - entry['date']).days
             if delta_days not in (1, 2, 3):
+                notes.append(f"skip: delta_days={delta_days} (animal_id={entry['animal_id']})")
+                current_app.logger.info(f"[SurgeryNotify SKIP] delta_days={delta_days} "
+                                        f"animal_id={entry['animal_id']}")
+                skipped += 1
                 continue
+
             day_key = "day_" + num_to_word[delta_days]
 
-            edit_url = "<{}|Update Status Here>".format(
-                url_for('main.surgery_update', _external=True,
-                        animal_id=entry['animal_id'], surgery_id=entry['surgery_id'])
+            # Decision to send
+            should_send = force or (
+                status.get('euthanized', 0) == 0 and status.get(day_key, 0) == 0
             )
 
-            if status['euthanized'] == 0 and status[day_key] == 0:
-                manager_message = (
-                    f"{entry['username'].title()} needs to check animal {entry['animal_id']} "
-                    f"in room {entry['mouse_room']} for surgery on {entry['date']}. {edit_url}"
+            edit_url = "<{}|Update Status Here>".format(
+                url_for('main.surgery_update',
+                        _external=True,
+                        animal_id=entry['animal_id'],
+                        surgery_id=entry['surgery_id'])
+            )
+
+            base_msg = (
+                f"{entry['username'].title()} needs to check animal {entry['animal_id']} "
+                f"in room {entry.get('mouse_room', 'N/A')} for surgery on {entry['date']}. {edit_url}"
+            )
+
+            if should_send:
+                try:
+                    # 1) surgery channel
+                    slack.send_to_surgery_channel(f"Reminder: {base_msg}", ping_channel=True)
+                    # 2) manager DM (surgery)
+                    slack.dm_surgery_manager(base_msg)
+                    # 3) shikigami feed copy
+                    slack.send_to_shikigami_feed(f"[surgery] {base_msg}")
+                except Exception as e:
+                    errors += 1
+                    current_app.logger.exception(f"[SurgeryNotify ERROR] send failed: {e}")
+                    try:
+                        slack.dm_shikigami_manager(f":rotating_light: Surgery notify send failed: {e}")
+                    except Exception:
+                        pass
+                else:
+                    sent += 1
+                    notes.append(f"sent: animal_id={entry['animal_id']} day={delta_days}{' (forced)' if force else ''}")
+            else:
+                # log the precise skip reason
+                reason_flags = []
+                if status.get('euthanized', 0) != 0:
+                    reason_flags.append("euthanized=1")
+                if status.get(day_key, 0) != 0:
+                    reason_flags.append(f"{day_key}=1")
+                reason = " and ".join(reason_flags) if reason_flags else "unknown_reason"
+                current_app.logger.info(
+                    f"[SurgeryNotify SKIP] animal_id={entry['animal_id']} day={delta_days} reason={reason}"
                 )
-                ch_message = f"<!channel> Reminder: {manager_message}"
+                notes.append(f"skip: {reason} (animal_id={entry['animal_id']})")
+                skipped += 1
 
-                if manager_dm:
-                    client.chat_postMessage(channel=manager_dm, text=manager_message)
-                if channel_id:
-                    client.chat_postMessage(channel=channel_id, text=ch_message)
-
-                if len(slacktable.SlackUser & entry) > 0:
-                    # prefer storing UIDs (U…) in SlackUser.slack_user; otherwise resolve name → UID
-                    surgeon_key = (slacktable.SlackUser & entry)
-                    slack_id_or_name = surgeon_key.fetch1('slack_user') \
-                        if hasattr(surgeon_key, 'fetch1') else surgeon_key.fetch('slack_user')[0]
-                    surgeon_uid = user_id_from_name(slack_id_or_name)
-                    if surgeon_uid:
-                        dm = dm_channel_for(surgeon_uid)
-                        pm_message = f"Don't forget to check on animal {entry['animal_id']} today! {edit_url}"
-                        client.chat_postMessage(channel=dm, text=pm_message)
-
-    except SlackApiError as e:
-        # log; don't try to post the error to Slack again
-        app.logger.exception(f"Slack API error: {e.response.get('error')}")
     except Exception as e:
-        app.logger.exception(f"Notification failed: {e}")
+        errors += 1
+        current_app.logger.exception(f"Surgery notification job failed: {e}")
+        try:
+            slack.send_to_shikigami_feed(f":rotating_light: Surgery notification job failed: {e}", ping_channel=True)
+            slack.dm_shikigami_manager(f":rotating_light: Surgery notification job failed: {e}")
+        except Exception:
+            pass
 
-    return '', http.HTTPStatus.NO_CONTENT
+    # Summary line always logs, even if nothing was sent
+    current_app.logger.info(
+        f"[SurgeryNotify SUMMARY] sent={sent} skipped={skipped} errors={errors} dry_run={slack.env.notify_dry_run}"
+    )
+
+    return jsonify({
+        "status": "ok",
+        "date": today.isoformat(),
+        "dry_run": slack.env.notify_dry_run,
+        "sent": sent,
+        "skipped": skipped,
+        "errors": errors,
+        "notes": notes,
+        "forced": force,
+    }), HTTPStatus.OK
+
 
 
 @main.route('/api/v1/surgery/spawn_missing_data', methods=['GET'])
