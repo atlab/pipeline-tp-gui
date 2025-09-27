@@ -1,35 +1,45 @@
+# syntax=docker/dockerfile:1.6
+
 FROM python:3.8
 
-MAINTAINER Fabian Sinz <sinz@bcm.com>, Cameron Smith <camerons@bcm.edu>, Christos Papadopoulos <cpapadop@bcm.com>
+LABEL org.opencontainers.image.authors="spapadop@stanford.edu"
 
-# Defines where the app will be run from
-ENV APP /app
+# App dir and basic env
+ENV APP=/app \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    TZ=America/Chicago \
+    DEBIAN_FRONTEND=noninteractive
 
-RUN mkdir $APP
-WORKDIR $APP
+WORKDIR ${APP}
 
-# Expose the port uWSGI will listen on
-EXPOSE 5000
+# OS deps: tzdata (TZ), curl (optional for healthchecks), then cleanup
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends tzdata curl \
+ && rm -rf /var/lib/apt/lists/*
 
-# Install ubuntu packages
-RUN apt-get update
-# RUN apt install -y graphviz libffi6 libffi-dev libssl-dev
-ARG DEBIAN_FRONTEND=noninteractive
-ENV TZ=America/Chicago
-RUN apt-get install -y tzdata
+# --- Python deps ---
+# Tip: for fully reproducible bases, pin python:3.8 to a digest.
 
-# Upgrade pip
-RUN pip3 install --upgrade pip
+# Copy just requirements first to maximize cache hits
+COPY requirements.txt ./
 
-# Copy and install Python dependencies
-COPY requirements.txt .
-RUN pip3 install --upgrade setuptools # otherwise cairocffi cannot be installed (https://github.com/lief-project/LIEF/issues/108)
-RUN pip3 install --upgrade git+https://github.com/atlab/datajoint-python
-RUN pip3 install -r requirements.txt
+# Install requirements using BuildKit cache for pip wheels
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -m pip install --upgrade pip setuptools && \
+    python -m pip install -r requirements.txt
 
-# We copy the rest of the codebase into the image
+# Pin the DataJoint git dependency by commit to avoid cache busting & drift
+# (Replace the default if you need a different, vetted commit.)
+ARG DATAJOINT_COMMIT=65253dc1561af0c6692baf98d3058d49f3817826
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -m pip install "git+https://github.com/atlab/datajoint-python@${DATAJOINT_COMMIT}"
+
+# App code (placed after deps so code changes don't invalidate dependency layers)
 COPY . .
 
-# Run uWSGI with its ini file.
-# Might be better to use entrypoint here?
-CMD [ "uwsgi", "--enable-threads", "--ini", "app.ini" ]
+# uWSGI listens on 5000 (as app.ini expects)
+EXPOSE 5000
+
+# Run uWSGI with its ini
+CMD ["uwsgi", "--enable-threads", "--ini", "app.ini"]
