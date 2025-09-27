@@ -1,4 +1,4 @@
-version: '2'
+name: pipeline-tp-gui
 
 services:
   flask:
@@ -8,10 +8,23 @@ services:
       dockerfile: Dockerfile.flask
     env_file: .env
     volumes:
-      - /etc/timezone:/etc/timezone
-      - /etc/localtime:/etc/localtime
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
       - /mnt:/mnt
-      
+    restart: unless-stopped
+    healthcheck:
+      # Ensure your Flask app serves /healthz with HTTP 200
+      test: ["CMD", "curl", "-fsS", "http://localhost:5000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
   nginx:
     image: pipecontrol-nginx
     build:
@@ -19,6 +32,13 @@ services:
       dockerfile: Dockerfile.nginx
     env_file: .env
     ports:
-      - 9999:9999
+      - "9999:9999"
     depends_on:
-      - flask
+      flask:
+        condition: service_healthy
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
